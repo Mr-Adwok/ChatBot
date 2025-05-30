@@ -1,0 +1,128 @@
+import os
+from typing import List, Dict, Optional
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from groq import Groq
+from groq.types.chat import ChatCompletionMessageParam
+from fastapi.middleware.cors import CORSMiddleware
+
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not GROQ_API_KEY:
+    raise ValueError("API key for Groq is missing. Please set the GROQ_API_KEY in the .env file.")
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+client = Groq(api_key=GROQ_API_KEY)
+
+class UserInput(BaseModel):
+    message: str
+    role: str = "user"
+    conversation_id: str
+
+class Conversation:
+    def __init__(self):
+        self.messages: List[Dict[str, str]] = [
+            {"role": "system", "content": "You are a useful AI assistant."}
+        ]
+        self.active: bool = True
+
+conversations: Dict[str, Conversation] = {}
+
+def query_groq_api(conversation: List[Dict[str, str]]) -> str:
+    try:
+        # Convert and validate messages
+        messages: List[ChatCompletionMessageParam] = []
+        for msg in conversation:
+            if msg["role"] not in ["system", "user", "assistant"]:
+                raise ValueError(f"Invalid role: {msg['role']}")
+            if not isinstance(msg["content"], str):
+                raise ValueError("Message content must be a string")
+
+            messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            }) # type: ignore
+
+        completion = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=messages,
+            temperature=1,
+            max_tokens=1024,
+            top_p=1,
+            stream=True,
+            stop=None,
+        )
+
+        response = ""
+        for chunk in completion:
+            if chunk.choices and chunk.choices[0].delta.content:
+                response += chunk.choices[0].delta.content
+
+        return response
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error with Groq API: {str(e)}"
+        )
+
+def get_or_create_conversation(conversation_id: str) -> Conversation:
+    if conversation_id not in conversations:
+        conversations[conversation_id] = Conversation()
+    return conversations[conversation_id]
+
+@app.post("/chat/")
+async def chat(input: UserInput):
+    conversation = get_or_create_conversation(input.conversation_id)
+
+    if not conversation.active:
+        raise HTTPException(
+            status_code=400,
+            detail="The chat session has ended. Please start a new session."
+        )
+
+    try:
+        # Validate role before appending
+        if input.role not in ["system", "user", "assistant"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid role. Must be 'system', 'user', or 'assistant'"
+            )
+
+        conversation.messages.append({
+            "role": input.role,
+            "content": input.message
+        })
+
+        response = query_groq_api(conversation.messages)  # Pass messages directly
+
+        conversation.messages.append({
+            "role": "assistant",
+            "content": response
+        })
+
+        return {
+            "response": response,
+            "conversation_id": input.conversation_id
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
